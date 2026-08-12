@@ -10,6 +10,7 @@ from matplotlib import font_manager
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor
 
@@ -123,8 +124,56 @@ def load_data() -> pd.DataFrame:
         usecols=["timestamp", "outside_temp", "heat_power"],
         parse_dates=["timestamp"],
     )
-    data = data.dropna(subset=["timestamp", "outside_temp", "heat_power"])
+    original_rows = len(data)
+    data = data.dropna(subset=["timestamp"])
     data = data.sort_values("timestamp").set_index("timestamp")
+
+    # 保留 heat_power == 0 的真实停机/低负荷状态，只处理负值和越界室外温度。
+    negative_heat_power_mask = data["heat_power"] < 0
+    outside_temp_out_of_range_mask = ~data["outside_temp"].between(-40, 50)
+    negative_heat_power_count = int(negative_heat_power_mask.sum())
+    outside_temp_out_of_range_count = int(outside_temp_out_of_range_mask.sum())
+    data.loc[negative_heat_power_mask, "heat_power"] = np.nan
+    data.loc[outside_temp_out_of_range_mask, "outside_temp"] = np.nan
+
+    value_columns = ["outside_temp", "heat_power"]
+    missing_before_imputation = int(data[value_columns].isna().sum().sum())
+    interpolated_data = data[value_columns].interpolate(
+        method="linear", limit=2
+    )
+    missing_after_interpolation = int(interpolated_data.isna().sum().sum())
+    linear_interpolated_count = (
+        missing_before_imputation - missing_after_interpolation
+    )
+
+    filled_data = interpolated_data.ffill()
+    missing_after_ffill = int(filled_data.isna().sum().sum())
+    forward_filled_count = missing_after_interpolation - missing_after_ffill
+    data[value_columns] = filled_data
+
+    remaining_missing_mask = data[value_columns].isna().any(axis=1)
+    remaining_missing_count = int(remaining_missing_mask.sum())
+    if remaining_missing_count > 0:
+        print(
+            f"警告：插补后仍有 {remaining_missing_count} 行存在缺失值，"
+            "这些行将被删除。"
+        )
+        data = data.loc[~remaining_missing_mask]
+
+    total_imputed_count = linear_interpolated_count + forward_filled_count
+    removed_rows = original_rows - len(data)
+    print(f"原始行数: {original_rows}")
+    print(f"负值替换为 NaN 的数量（heat_power）: {negative_heat_power_count}")
+    print(
+        "越界替换为 NaN 的数量（outside_temp）: "
+        f"{outside_temp_out_of_range_count}"
+    )
+    print(f"线性插补数量: {linear_interpolated_count}")
+    print(f"前向填充数量: {forward_filled_count}")
+    print(f"成功插补的数量: {total_imputed_count}")
+    print(f"最终剩余缺失值数量: {missing_after_ffill}")
+    print(f"因缺失值删除的行数: {removed_rows}")
+
     return data
 
 
@@ -278,6 +327,16 @@ def main() -> None:
     )
     model.fit(X_train, y_train)
     predictions = model.predict(X_test)
+
+    # 使用完全相同的训练/测试特征建立线性回归基线，便于比较非线性模型的收益。
+    baseline_model = LinearRegression()
+    baseline_model.fit(X_train, y_train)
+    baseline_predictions = baseline_model.predict(X_test)
+    baseline_mae, _, baseline_smape = calculate_metrics(
+        y_test, baseline_predictions
+    )
+    print(f"线性回归 MAE: {baseline_mae:.4f}")
+    print(f"线性回归 sMAPE: {baseline_smape:.2f}%")
 
     # 仅在评估阶段排除真实热功率低于 1.0 的低负荷样本。
     evaluation_mask = y_test >= 1.0
