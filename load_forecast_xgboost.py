@@ -19,6 +19,68 @@ PREFERRED_DATA_FILE = BASE_DIR / "heat_exchange_data_with_iforest.csv"
 FALLBACK_DATA_FILE = BASE_DIR / "heat_exchange_data.csv"
 OUTPUT_DIR = BASE_DIR / "docs"
 
+# Serbia non-working public and religious holidays covered by this dataset.
+# The list includes statutory carry-over days when a public holiday falls on Sunday.
+SERBIA_PUBLIC_HOLIDAYS = pd.to_datetime(
+    [
+        # 2017
+        "2017-01-01",
+        "2017-01-02",
+        "2017-01-03",
+        "2017-01-07",
+        "2017-02-15",
+        "2017-02-16",
+        "2017-04-14",
+        "2017-04-15",
+        "2017-04-16",
+        "2017-04-17",
+        "2017-05-01",
+        "2017-05-02",
+        "2017-11-11",
+        # 2018
+        "2018-01-01",
+        "2018-01-02",
+        "2018-01-07",
+        "2018-02-15",
+        "2018-02-16",
+        "2018-04-06",
+        "2018-04-07",
+        "2018-04-08",
+        "2018-04-09",
+        "2018-05-01",
+        "2018-05-02",
+        "2018-11-11",
+        "2018-11-12",
+        # 2019
+        "2019-01-01",
+        "2019-01-02",
+        "2019-01-07",
+        "2019-02-15",
+        "2019-02-16",
+        "2019-04-26",
+        "2019-04-27",
+        "2019-04-28",
+        "2019-04-29",
+        "2019-05-01",
+        "2019-05-02",
+        "2019-11-11",
+        # 2020
+        "2020-01-01",
+        "2020-01-02",
+        "2020-01-07",
+        "2020-02-15",
+        "2020-02-16",
+        "2020-02-17",
+        "2020-04-17",
+        "2020-04-18",
+        "2020-04-19",
+        "2020-04-20",
+        "2020-05-01",
+        "2020-05-02",
+        "2020-11-11",
+    ]
+).normalize()
+
 
 def configure_matplotlib_font() -> None:
     """按字体名称查找系统中文字体，避免中文字符触发字体缺失警告。"""
@@ -69,18 +131,35 @@ def load_data() -> pd.DataFrame:
 def build_features(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     """构造时间、滞后和气象特征。"""
     features = pd.DataFrame(index=data.index)
-    features["hour"] = data.index.hour
+    hour = data.index.hour
+    features["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+    features["hour_cos"] = np.cos(2 * np.pi * hour / 24)
     features["day_of_week"] = data.index.dayofweek
     features["is_weekend"] = (data.index.dayofweek >= 5).astype(int)
     features["lag_1"] = data["heat_power"].shift(1)
     features["lag_2"] = data["heat_power"].shift(2)
     features["lag_24"] = data["heat_power"].shift(24)
+    shifted_heat_power = data["heat_power"].shift(1)
+    features["rolling_mean_6h"] = shifted_heat_power.rolling(
+        window=6, min_periods=1
+    ).mean()
+    features["rolling_std_6h"] = shifted_heat_power.rolling(
+        window=6, min_periods=1
+    ).std()
     features["outside_temp"] = data["outside_temp"]
+    features["is_holiday"] = data.index.normalize().isin(
+        SERBIA_PUBLIC_HOLIDAYS
+    ).astype(int)
 
-    # 仅对序列开头没有历史值的滞后特征补 0，避免丢失前 24 个样本。
-    features[["lag_1", "lag_2", "lag_24"]] = features[
-        ["lag_1", "lag_2", "lag_24"]
-    ].fillna(0)
+    # 仅使用历史数据构造滞后和滚动特征，避免将未来信息泄露到训练样本。
+    history_features = [
+        "lag_1",
+        "lag_2",
+        "lag_24",
+        "rolling_mean_6h",
+        "rolling_std_6h",
+    ]
+    features[history_features] = features[history_features].fillna(0)
     return features, data["heat_power"]
 
 
@@ -303,6 +382,26 @@ def main() -> None:
     plt.tight_layout()
     plt.savefig(OUTPUT_DIR / "winter_day_stable_heating_scatter.png", dpi=150)
     plt.close()
+
+    # 分层评估只改变指标切片，不改变模型训练和预测结果。
+    # 使用 y_true >= 1.0 与主 MAPE 口径保持一致，避免低负荷样本放大百分比误差。
+    normal_load_mask = y_test >= 1.0
+    test_day_of_week = pd.Series(y_test.index.dayofweek, index=y_test.index)
+    test_hour = pd.Series(y_test.index.hour, index=y_test.index)
+    temporal_slices = {
+        "工作日": test_day_of_week < 5,
+        "周末": test_day_of_week >= 5,
+        "白天（08-18时）": (test_hour >= 8) & (test_hour <= 18),
+        "夜间（19-07时）": (test_hour >= 19) | (test_hour <= 7),
+    }
+    print("\n按时间维度分层评估（y_true >= 1.0）:")
+    print(f"{'时段':<18}{'样本数':>10}{'MAPE':>14}")
+    for slice_name, slice_mask in temporal_slices.items():
+        evaluation_mask = normal_load_mask & slice_mask
+        slice_y_true = y_test.loc[evaluation_mask]
+        slice_y_pred = predictions[evaluation_mask.to_numpy()]
+        _, slice_mape, _ = calculate_metrics(slice_y_true, slice_y_pred)
+        print(f"{slice_name:<18}{len(slice_y_true):>10}{slice_mape:>13.2f}%")
 
     save_plots(model, list(features.columns), y_test, predictions)
     print(f"图表已保存到: {OUTPUT_DIR}")
