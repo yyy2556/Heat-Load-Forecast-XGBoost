@@ -161,7 +161,7 @@ python load_forecast_xgboost.py
 ## 项目结构
 
 ```text
-project2/
+Heat-Load-Forecast-XGBoost/
 ├── load_forecast_xgboost.py
 ├── README.md
 ├── LICENSE
